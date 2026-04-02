@@ -1,0 +1,70 @@
+name: Cosmos DB Data Pull
+
+on:
+  schedule:
+    # Runs every 6 hours: midnight, 6am, noon, 6pm UTC
+    - cron: '0 0,6,12,18 * * *'
+  workflow_dispatch:
+    # Also allows you to trigger it manually from the GitHub Actions tab
+
+jobs:
+  pull-data:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+
+    steps:
+      # 1. Check out the repo so the script and data files are available
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Set up Python
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # 3. Install dependencies
+      - name: Install dependencies
+        run: pip install azure-cosmos pandas openpyxl
+
+      # 4. Download the existing Excel file and timestamp from the previous run
+      #    Uses the GitHub CLI to check if an artifact exists before downloading
+      #    This avoids the "artifact not found" error on the very first run
+      - name: Download previous data artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Checking for existing telemetry-data artifact..."
+          ARTIFACT_ID=$(gh api repos/${{ github.repository }}/actions/artifacts \
+            --jq '[.artifacts[] | select(.name=="telemetry-data" and .expired==false)] | sort_by(.created_at) | last | .id')
+
+          if [ "$ARTIFACT_ID" = "null" ] || [ -z "$ARTIFACT_ID" ]; then
+            echo "No previous artifact found — first run, starting fresh."
+          else
+            echo "Found artifact ID $ARTIFACT_ID, downloading..."
+            gh api repos/${{ github.repository }}/actions/artifacts/$ARTIFACT_ID/zip > artifact.zip
+            unzip -o artifact.zip -d .
+            rm artifact.zip
+            echo "Previous data restored successfully."
+          fi
+
+      # 5. Run the Python script
+      - name: Run Cosmos DB pull script
+        env:
+          COSMOS_ENDPOINT: ${{ secrets.COSMOS_ENDPOINT }}
+          COSMOS_KEY: ${{ secrets.COSMOS_KEY }}
+        run: python cosmos_pull.py
+
+      # 6. Upload the updated Excel file and timestamp as an artifact
+      #    so it persists and can be downloaded / used in the next run
+      - name: Upload updated data artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: telemetry-data
+          path: |
+            cosmos_telemetry.xlsx
+            last_pull_timestamp.json
+          retention-days: 90
+          overwrite: true
