@@ -7,25 +7,25 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 # ── SETTINGS ───────────────────────────────────────────────
-ENDPOINT       = os.environ["COSMOS_ENDPOINT"]
-KEY            = os.environ["COSMOS_KEY"]
-DATABASE_NAME  = "telemetry"
-CONTAINER_NAME = "device-telemetry"
-OUTPUT_FILE    = "cosmos_telemetry.xlsx"
-TIMESTAMP_FILE = "last_pull_timestamp.json"
+ENDPOINT        = os.environ["COSMOS_ENDPOINT"]
+KEY             = os.environ["COSMOS_KEY"]
+DATABASE_NAME   = "telemetry"
+CONTAINER_NAME  = "device-telemetry"
+TIMESTAMP_FILE  = "last_pull_timestamp.json"
+
+# Output file per site — {site_id} is replaced with the actual siteId value
+# e.g. "telemetry_SiteA.xlsx", "telemetry_SiteB.xlsx" etc.
+OUTPUT_PATTERN  = "telemetry_{site_id}.xlsx"
 
 # Rows per batch before writing to Excel and checkpointing
-BATCH_SIZE     = 5000
+BATCH_SIZE      = 5000
 
-# Stop fetching after this many seconds and upload what we have.
-# GitHub Actions kills jobs at 6 hours (21600s). We stop at 5.5 hours (19800s)
-# to leave time for the final Excel write and artifact upload.
+# Stop fetching at 5.5 hours to allow time for upload before GitHub's 6hr kill
 MAX_RUN_SECONDS = 19800
 
 # ── HELPERS ────────────────────────────────────────────────
 
 def load_state():
-    """Load last pull timestamp and any in-progress checkpoint."""
     if Path(TIMESTAMP_FILE).exists():
         with open(TIMESTAMP_FILE, "r") as f:
             data = json.load(f)
@@ -34,7 +34,6 @@ def load_state():
 
 
 def save_state(last_pull=None, checkpoint_date=None):
-    """Save pull state — preserves existing keys if not overwriting."""
     existing = {}
     if Path(TIMESTAMP_FILE).exists():
         with open(TIMESTAMP_FILE, "r") as f:
@@ -49,7 +48,6 @@ def save_state(last_pull=None, checkpoint_date=None):
 
 
 def clear_checkpoint():
-    """Clear the checkpoint once a full run completes."""
     if Path(TIMESTAMP_FILE).exists():
         with open(TIMESTAMP_FILE, "r") as f:
             data = json.load(f)
@@ -59,7 +57,6 @@ def clear_checkpoint():
 
 
 def build_query(since_date):
-    """Build query filtering to needed event types and records newer than since_date."""
     query = """
 SELECT
     c.message.siteId,
@@ -82,54 +79,53 @@ WHERE c.message.event IN ('Tracker telemetry', 'Tracker telemetry v13', 'Weather
 """
     if since_date:
         query += " AND c.message.telemetryDate > '{}'".format(since_date)
-
     return query
 
 
 def extract_telemetry_date(item):
-    """
-    Safely extract telemetryDate from a CosmosDB item.
-    Handles both nested (item['message']['telemetryDate'])
-    and flattened (item['telemetryDate']) structures.
-    """
-    # Try nested structure first
+    """Safely extract telemetryDate from nested or flat CosmosDB response."""
     msg = item.get("message")
     if isinstance(msg, dict):
         date_val = msg.get("telemetryDate")
         if date_val:
             return str(date_val)
-
-    # Try flat structure (happens when SELECT aliases flatten the response)
     date_val = item.get("telemetryDate")
     if date_val:
         return str(date_val)
-
     return None
 
 
+def extract_site_id(item):
+    """Safely extract siteId from nested or flat CosmosDB response."""
+    msg = item.get("message")
+    if isinstance(msg, dict):
+        site = msg.get("siteId")
+        if site:
+            return str(site).strip().replace("/", "-").replace(" ", "_")
+    site = item.get("siteId")
+    if site:
+        return str(site).strip().replace("/", "-").replace(" ", "_")
+    return "Unknown"
+
+
 def flatten_batch(df):
-    """Clean up a batch DataFrame — unpack origData, fix types, reorder."""
-    # Remove 'message.' prefix from column names
+    """Clean up column names, unpack origData, enforce types, reorder."""
     df.columns = [col.replace("message.", "") for col in df.columns]
 
-    # Unpack origData to extract device name
     if "origData" in df.columns:
         df["deviceName"] = df["origData"].apply(
             lambda x: x.get("name") if isinstance(x, dict) else None
         )
         df = df.drop(columns=["origData"])
 
-    # Drop CosmosDB internal columns
     internal_cols = ["_rid", "_self", "_etag", "_attachments", "_ts"]
     df = df.drop(columns=internal_cols, errors="ignore")
 
-    # Convert telemetryDate to timezone-naive datetime (Excel requirement)
     if "telemetryDate" in df.columns:
         df["telemetryDate"] = pd.to_datetime(
             df["telemetryDate"], errors="coerce", utc=True
         ).dt.tz_localize(None)
 
-    # Numeric columns
     numeric_cols = [
         "trackerCurrentAngle", "trackerTargetAngle", "motorCurrent",
         "batteryCharge", "batteryTemperature", "batteryCycleCount",
@@ -139,7 +135,6 @@ def flatten_batch(df):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Reorder columns logically
     preferred_order = [
         "siteId", "deviceId", "deviceName", "event", "telemetryDate",
         "trackerCurrentAngle", "trackerTargetAngle", "motorCurrent",
@@ -148,15 +143,13 @@ def flatten_batch(df):
     ]
     existing = [c for c in preferred_order if c in df.columns]
     extras   = [c for c in df.columns if c not in preferred_order]
-    df = df[existing + extras]
-
-    return df
+    return df[existing + extras]
 
 
 def append_batch_to_excel(batch_df, output_file):
     """
-    Append a batch to the Excel file.
-    Deduplicates on siteId + deviceId + telemetryDate and sorts before saving.
+    Append a batch to the correct site Excel file.
+    Deduplicates and sorts before saving.
     """
     if Path(output_file).exists():
         existing_df = pd.read_excel(output_file)
@@ -168,13 +161,11 @@ def append_batch_to_excel(batch_df, output_file):
     else:
         combined_df = batch_df
 
-    # Deduplicate
     dedup_cols = ["siteId", "deviceId", "telemetryDate"]
     available  = [c for c in dedup_cols if c in combined_df.columns]
     if available:
         combined_df = combined_df.drop_duplicates(subset=available, keep="last")
 
-    # Sort
     sort_cols = [c for c in ["siteId", "deviceId", "telemetryDate"]
                  if c in combined_df.columns]
     if sort_cols:
@@ -182,6 +173,23 @@ def append_batch_to_excel(batch_df, output_file):
 
     combined_df.to_excel(output_file, index=False)
     return len(combined_df)
+
+
+def write_batch_by_site(batch_df):
+    """
+    Split a batch by siteId and append each slice to the correct site file.
+    Returns a dict of {site_id: row_count_in_file}.
+    """
+    results = {}
+    for site_id, site_df in batch_df.groupby("siteId", dropna=False):
+        # Sanitize site_id for use in filename
+        safe_site = str(site_id).strip().replace("/", "-").replace(" ", "_")
+        if not safe_site or safe_site == "nan":
+            safe_site = "Unknown"
+        output_file = OUTPUT_PATTERN.format(site_id=safe_site)
+        count = append_batch_to_excel(site_df.copy(), output_file)
+        results[safe_site] = count
+    return results
 
 
 # ── MAIN ───────────────────────────────────────────────────
@@ -193,9 +201,9 @@ def main():
     print("\n" + "="*50)
     print("Pull started: {}".format(pull_started_at))
     print("Max run time: {:.0f} minutes".format(MAX_RUN_SECONDS / 60))
+    print("Output: one Excel file per site ({})".format(OUTPUT_PATTERN))
     print("="*50)
 
-    # Load state
     last_timestamp, checkpoint_date = load_state()
 
     if checkpoint_date:
@@ -208,7 +216,6 @@ def main():
         since_date = None
         print("First run — fetching ALL data.")
 
-    # Connect
     print("\nConnecting to Cosmos DB...")
     client    = CosmosClient(ENDPOINT, KEY)
     container = (
@@ -219,57 +226,49 @@ def main():
 
     query = build_query(since_date)
     print("\nQuery:\n{}".format(query))
-    print("\nFetching in batches of {:,}...".format(BATCH_SIZE))
+    print("\nFetching in batches of {:,}...\n".format(BATCH_SIZE))
 
-    batch           = []
-    total_fetched   = 0
-    batch_count     = 0
-    last_date_seen  = None
-    timed_out       = False
+    batch          = []
+    total_fetched  = 0
+    batch_count    = 0
+    last_date_seen = None
+    timed_out      = False
 
     for item in container.query_items(
         query=query,
         enable_cross_partition_query=True
     ):
-        # Extract telemetryDate for checkpointing using robust helper
         item_date = extract_telemetry_date(item)
         if item_date:
             last_date_seen = item_date
 
         batch.append(item)
 
-        # Check if we're approaching the time limit
+        # Check time limit
         elapsed = time.time() - run_start_time
         if elapsed >= MAX_RUN_SECONDS:
-            print("\nApproaching 5.5 hour time limit — stopping fetch to save progress.", flush=True)
+            print("\nApproaching 5.5hr limit — stopping to save progress.", flush=True)
             timed_out = True
             break
 
-        # Write batch when full
         if len(batch) >= BATCH_SIZE:
             batch_count   += 1
             batch_df       = pd.DataFrame(batch)
             batch_df       = flatten_batch(batch_df)
-            total_in_file  = append_batch_to_excel(batch_df, OUTPUT_FILE)
+            site_counts    = write_batch_by_site(batch_df)
             total_fetched += len(batch)
             batch          = []
 
-            # Save checkpoint after every batch
             if last_date_seen:
                 save_state(checkpoint_date=last_date_seen)
             else:
-                # If we still can't get a date, save row count as progress marker
-                print("WARNING: telemetryDate not found in batch {} — checkpoint not updated.".format(
+                print("WARNING: telemetryDate not found in batch {}".format(
                     batch_count), flush=True)
-                # Print first item structure so we can debug the field path
-                print("Sample item keys: {}".format(list(
-                    container.query_items(query="SELECT TOP 1 * FROM c", 
-                    enable_cross_partition_query=True)).__class__), flush=True)
 
-            elapsed_min = elapsed / 60
-            print("Batch {:>3} | {:>8,} fetched | {:>8,} in file | {:.1f} min elapsed | checkpoint: {}".format(
-                batch_count, total_fetched, total_in_file,
-                elapsed_min, last_date_seen
+            print("Batch {:>3} | {:>8,} fetched | {:.1f} min | checkpoint: {} | files: {}".format(
+                batch_count, total_fetched,
+                elapsed / 60, last_date_seen,
+                {k: "{:,}".format(v) for k, v in site_counts.items()}
             ), flush=True)
 
     # Write final partial batch
@@ -277,24 +276,25 @@ def main():
         batch_count   += 1
         batch_df       = pd.DataFrame(batch)
         batch_df       = flatten_batch(batch_df)
-        total_in_file  = append_batch_to_excel(batch_df, OUTPUT_FILE)
+        site_counts    = write_batch_by_site(batch_df)
         total_fetched += len(batch)
-        elapsed_min    = (time.time() - run_start_time) / 60
-        print("Batch {:>3} | {:>8,} fetched | {:>8,} in file | {:.1f} min elapsed | checkpoint: {}".format(
-            batch_count, total_fetched, total_in_file,
-            elapsed_min, last_date_seen
+        elapsed        = time.time() - run_start_time
+        if last_date_seen:
+            save_state(checkpoint_date=last_date_seen)
+        print("Batch {:>3} | {:>8,} fetched | {:.1f} min | checkpoint: {} | files: {}".format(
+            batch_count, total_fetched,
+            elapsed / 60, last_date_seen,
+            {k: "{:,}".format(v) for k, v in site_counts.items()}
         ), flush=True)
 
     # Save final state
     if timed_out:
-        # Save checkpoint so next run resumes where we left off
         if last_date_seen:
             save_state(checkpoint_date=last_date_seen)
-        print("\nRun timed out after {:.1f} minutes. Checkpoint saved.".format(
-            (time.time() - run_start_time) / 60))
-        print("Next run will resume from: {}".format(last_date_seen))
+        print("\nTimed out after {:.1f} min. Checkpoint saved at: {}".format(
+            (time.time() - run_start_time) / 60, last_date_seen))
+        print("Next run will resume from this point.")
     else:
-        # Full run completed — save pull timestamp and clear checkpoint
         save_state(last_pull=pull_started_at)
         clear_checkpoint()
         print("\nFull run complete!")
@@ -306,4 +306,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
