@@ -22,7 +22,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install azure-cosmos pandas openpyxl
+        run: pip install azure-cosmos pandas openpyxl requests
 
       - name: Download previous data artifacts
         env:
@@ -49,6 +49,14 @@ jobs:
           COSMOS_ENDPOINT: ${{ secrets.COSMOS_ENDPOINT }}
           COSMOS_KEY: ${{ secrets.COSMOS_KEY }}
         run: python cosmos_pull.py
+
+      - name: Upload CSV files to OneDrive
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ONEDRIVE_USER_EMAIL: ${{ secrets.ONEDRIVE_USER_EMAIL }}
+        run: python upload_to_onedrive.py
 
       - name: Upload updated data artifacts
         uses: actions/upload-artifact@v4
