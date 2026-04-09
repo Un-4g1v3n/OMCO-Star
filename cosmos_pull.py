@@ -13,15 +13,11 @@ DATABASE_NAME   = "telemetry"
 CONTAINER_NAME  = "device-telemetry"
 TIMESTAMP_FILE  = "last_pull_timestamp.json"
 
-# Output file per site — {site_id} is replaced with the actual siteId value
-# e.g. "telemetry_SiteA.xlsx", "telemetry_SiteB.xlsx" etc.
-OUTPUT_PATTERN  = "telemetry_{site_id}.xlsx"
+# CSV output per site — no row limit unlike Excel
+OUTPUT_PATTERN  = "telemetry_{site_id}.csv"
 
-# Rows per batch before writing to Excel and checkpointing
 BATCH_SIZE      = 5000
-
-# Stop fetching at 5.5 hours to allow time for upload before GitHub's 6hr kill
-MAX_RUN_SECONDS = 19800
+MAX_RUN_SECONDS = 19800  # 5.5 hours
 
 # ── HELPERS ────────────────────────────────────────────────
 
@@ -83,7 +79,6 @@ WHERE c.message.event IN ('Tracker telemetry', 'Tracker telemetry v13', 'Weather
 
 
 def extract_telemetry_date(item):
-    """Safely extract telemetryDate from nested or flat CosmosDB response."""
     msg = item.get("message")
     if isinstance(msg, dict):
         date_val = msg.get("telemetryDate")
@@ -95,21 +90,7 @@ def extract_telemetry_date(item):
     return None
 
 
-def extract_site_id(item):
-    """Safely extract siteId from nested or flat CosmosDB response."""
-    msg = item.get("message")
-    if isinstance(msg, dict):
-        site = msg.get("siteId")
-        if site:
-            return str(site).strip().replace("/", "-").replace(" ", "_")
-    site = item.get("siteId")
-    if site:
-        return str(site).strip().replace("/", "-").replace(" ", "_")
-    return "Unknown"
-
-
 def flatten_batch(df):
-    """Clean up column names, unpack origData, enforce types, reorder."""
     df.columns = [col.replace("message.", "") for col in df.columns]
 
     if "origData" in df.columns:
@@ -121,10 +102,11 @@ def flatten_batch(df):
     internal_cols = ["_rid", "_self", "_etag", "_attachments", "_ts"]
     df = df.drop(columns=internal_cols, errors="ignore")
 
+    # For CSV, keep telemetryDate as a clean string — no timezone issues
     if "telemetryDate" in df.columns:
         df["telemetryDate"] = pd.to_datetime(
             df["telemetryDate"], errors="coerce", utc=True
-        ).dt.tz_localize(None)
+        ).dt.strftime("%Y-%m-%d %H:%M:%S")
 
     numeric_cols = [
         "trackerCurrentAngle", "trackerTargetAngle", "motorCurrent",
@@ -146,48 +128,59 @@ def flatten_batch(df):
     return df[existing + extras]
 
 
-def append_batch_to_excel(batch_df, output_file):
+def append_batch_to_csv(batch_df, output_file):
     """
-    Append a batch to the correct site Excel file.
-    Deduplicates and sorts before saving.
+    Append a batch to the site CSV file.
+    On first write includes header. Subsequent writes append without header.
+    Deduplication is skipped during append for performance — full dedup
+    runs at the end of each complete run instead.
     """
-    if Path(output_file).exists():
-        existing_df = pd.read_excel(output_file)
-        if "telemetryDate" in existing_df.columns:
-            existing_df["telemetryDate"] = pd.to_datetime(
-                existing_df["telemetryDate"], errors="coerce"
-            ).dt.tz_localize(None)
-        combined_df = pd.concat([existing_df, batch_df], ignore_index=True)
-    else:
-        combined_df = batch_df
+    file_exists = Path(output_file).exists()
+    batch_df.to_csv(
+        output_file,
+        mode="a",               # append mode
+        header=not file_exists, # only write header if file is new
+        index=False
+    )
+    # Return approximate row count without reading the whole file
+    return sum(1 for _ in open(output_file)) - 1  # subtract header row
 
+
+def deduplicate_csv(output_file):
+    """
+    Read the full CSV, deduplicate, sort, and rewrite.
+    Called once at the end of a complete run (not every batch)
+    to keep incremental writes fast.
+    """
+    if not Path(output_file).exists():
+        return 0
+    print("  Deduplicating {}...".format(output_file), flush=True)
+    df = pd.read_csv(output_file)
+    before = len(df)
     dedup_cols = ["siteId", "deviceId", "telemetryDate"]
-    available  = [c for c in dedup_cols if c in combined_df.columns]
+    available  = [c for c in dedup_cols if c in df.columns]
     if available:
-        combined_df = combined_df.drop_duplicates(subset=available, keep="last")
-
+        df = df.drop_duplicates(subset=available, keep="last")
     sort_cols = [c for c in ["siteId", "deviceId", "telemetryDate"]
-                 if c in combined_df.columns]
+                 if c in df.columns]
     if sort_cols:
-        combined_df = combined_df.sort_values(sort_cols).reset_index(drop=True)
-
-    combined_df.to_excel(output_file, index=False)
-    return len(combined_df)
+        df = df.sort_values(sort_cols).reset_index(drop=True)
+    df.to_csv(output_file, index=False)
+    removed = before - len(df)
+    print("  {} — {:,} rows ({} duplicates removed)".format(
+        output_file, len(df), removed), flush=True)
+    return len(df)
 
 
 def write_batch_by_site(batch_df):
-    """
-    Split a batch by siteId and append each slice to the correct site file.
-    Returns a dict of {site_id: row_count_in_file}.
-    """
+    """Split batch by siteId and append each slice to the correct CSV."""
     results = {}
     for site_id, site_df in batch_df.groupby("siteId", dropna=False):
-        # Sanitize site_id for use in filename
         safe_site = str(site_id).strip().replace("/", "-").replace(" ", "_")
         if not safe_site or safe_site == "nan":
             safe_site = "Unknown"
         output_file = OUTPUT_PATTERN.format(site_id=safe_site)
-        count = append_batch_to_excel(site_df.copy(), output_file)
+        count = append_batch_to_csv(site_df.copy(), output_file)
         results[safe_site] = count
     return results
 
@@ -201,7 +194,7 @@ def main():
     print("\n" + "="*50)
     print("Pull started: {}".format(pull_started_at))
     print("Max run time: {:.0f} minutes".format(MAX_RUN_SECONDS / 60))
-    print("Output: one Excel file per site ({})".format(OUTPUT_PATTERN))
+    print("Output format: CSV (no row limit)")
     print("="*50)
 
     last_timestamp, checkpoint_date = load_state()
@@ -233,6 +226,7 @@ def main():
     batch_count    = 0
     last_date_seen = None
     timed_out      = False
+    site_files     = set()
 
     for item in container.query_items(
         query=query,
@@ -244,7 +238,6 @@ def main():
 
         batch.append(item)
 
-        # Check time limit
         elapsed = time.time() - run_start_time
         if elapsed >= MAX_RUN_SECONDS:
             print("\nApproaching 5.5hr limit — stopping to save progress.", flush=True)
@@ -256,16 +249,14 @@ def main():
             batch_df       = pd.DataFrame(batch)
             batch_df       = flatten_batch(batch_df)
             site_counts    = write_batch_by_site(batch_df)
+            site_files.update(site_counts.keys())
             total_fetched += len(batch)
             batch          = []
 
             if last_date_seen:
                 save_state(checkpoint_date=last_date_seen)
-            else:
-                print("WARNING: telemetryDate not found in batch {}".format(
-                    batch_count), flush=True)
 
-            print("Batch {:>3} | {:>8,} fetched | {:.1f} min | checkpoint: {} | files: {}".format(
+            print("Batch {:>3} | {:>8,} fetched | {:.1f} min | checkpoint: {} | rows in files: {}".format(
                 batch_count, total_fetched,
                 elapsed / 60, last_date_seen,
                 {k: "{:,}".format(v) for k, v in site_counts.items()}
@@ -277,27 +268,31 @@ def main():
         batch_df       = pd.DataFrame(batch)
         batch_df       = flatten_batch(batch_df)
         site_counts    = write_batch_by_site(batch_df)
+        site_files.update(site_counts.keys())
         total_fetched += len(batch)
         elapsed        = time.time() - run_start_time
         if last_date_seen:
             save_state(checkpoint_date=last_date_seen)
-        print("Batch {:>3} | {:>8,} fetched | {:.1f} min | checkpoint: {} | files: {}".format(
+        print("Batch {:>3} | {:>8,} fetched | {:.1f} min | checkpoint: {} | rows in files: {}".format(
             batch_count, total_fetched,
             elapsed / 60, last_date_seen,
             {k: "{:,}".format(v) for k, v in site_counts.items()}
         ), flush=True)
 
-    # Save final state
-    if timed_out:
+    # On a complete run, deduplicate all CSV files
+    if not timed_out:
+        print("\nDeduplicating and sorting all site files...")
+        for site_id in site_files:
+            deduplicate_csv(OUTPUT_PATTERN.format(site_id=site_id))
+        save_state(last_pull=pull_started_at)
+        clear_checkpoint()
+        print("\nFull run complete!")
+    else:
         if last_date_seen:
             save_state(checkpoint_date=last_date_seen)
         print("\nTimed out after {:.1f} min. Checkpoint saved at: {}".format(
             (time.time() - run_start_time) / 60, last_date_seen))
         print("Next run will resume from this point.")
-    else:
-        save_state(last_pull=pull_started_at)
-        clear_checkpoint()
-        print("\nFull run complete!")
 
     print("="*50)
     print("Total rows fetched this run: {:,}".format(total_fetched))
@@ -306,5 +301,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
