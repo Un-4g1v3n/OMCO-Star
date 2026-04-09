@@ -41,7 +41,7 @@ jobs:
             rm artifact.zip
             echo "Previous data restored."
             echo "Files restored:"
-            ls -lh telemetry_*.xlsx last_pull_timestamp.json 2>/dev/null || echo "None found"
+            ls -lh telemetry_*.csv last_pull_timestamp.json 2>/dev/null || echo "None found"
           fi
 
       - name: Run Cosmos DB pull script
@@ -55,7 +55,7 @@ jobs:
         with:
           name: telemetry-data
           path: |
-            telemetry_*.xlsx
+            telemetry_*.csv
             last_pull_timestamp.json
           retention-days: 90
           overwrite: true
