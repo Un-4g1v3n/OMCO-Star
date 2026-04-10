@@ -59,6 +59,7 @@ SELECT
     c.message.deviceId,
     c.message.event,
     c.message.telemetryDate,
+    c.message.ts,
     c.message.origData,
     c.message.trackerCurrentAngle,
     c.message.trackerTargetAngle,
