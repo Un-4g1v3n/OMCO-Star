@@ -9,13 +9,16 @@ import requests
 from pathlib import Path
 
 # ── SETTINGS (all from GitHub secrets) ─────────────────────
-CLIENT_ID     = os.environ["AZURE_CLIENT_ID"]
-CLIENT_SECRET = os.environ["AZURE_CLIENT_SECRET"]
-TENANT_ID     = os.environ["AZURE_TENANT_ID"]
+CLIENT_ID          = os.environ["AZURE_CLIENT_ID"]
+CLIENT_SECRET      = os.environ["AZURE_CLIENT_SECRET"]
+TENANT_ID          = os.environ["AZURE_TENANT_ID"]
+ONEDRIVE_USER_EMAIL = os.environ["ONEDRIVE_USER_EMAIL"]
 
 # OneDrive folder path where CSVs will be uploaded
-# Update this to match your exact OneDrive folder
 ONEDRIVE_FOLDER = "/Reliability/CosmosDB"
+
+# Files to skip — these are data quality artifacts, not real sites
+SKIP_FILES = {"telemetry_null.csv", "telemetry_Unknown.csv"}
 
 # ── AUTH ───────────────────────────────────────────────────
 
@@ -37,50 +40,18 @@ def get_access_token():
     return token
 
 
-def get_user_id(token):
-    """
-    Get the OneDrive user ID to upload to.
-    Uses the first user found — update ONEDRIVE_USER_EMAIL in secrets
-    to target a specific user if needed.
-    """
-    user_email = os.environ.get("ONEDRIVE_USER_EMAIL")
-    headers = {"Authorization": "Bearer {}".format(token)}
+# ── FOLDER ─────────────────────────────────────────────────
 
-    if user_email:
-        url = "https://graph.microsoft.com/v1.0/users/{}".format(user_email)
-    else:
-        # Fall back to listing users and picking the first
-        url = "https://graph.microsoft.com/v1.0/users"
-
-    response = requests.get(url, headers=headers)
-    response.raise_for_status()
-    data = response.json()
-
-    if user_email:
-        user_id = data.get("id")
-    else:
-        users = data.get("value", [])
-        if not users:
-            raise ValueError("No users found in tenant.")
-        user_id = users[0]["id"]
-        print("Targeting OneDrive of: {}".format(users[0].get("userPrincipalName")))
-
-    return user_id
-
-
-# ── UPLOAD ─────────────────────────────────────────────────
-
-def ensure_folder(token, user_id, folder_path):
+def ensure_folder(token, folder_path):
     """
     Ensure the target OneDrive folder exists, creating it if needed.
-    folder_path should be like '/Reliability/CosmosDB'
+    Uses the user's email directly — no user ID lookup required.
     """
     headers = {
         "Authorization": "Bearer {}".format(token),
         "Content-Type":  "application/json"
     }
 
-    # Build folder path step by step
     parts = [p for p in folder_path.strip("/").split("/") if p]
     current_path = ""
 
@@ -88,22 +59,21 @@ def ensure_folder(token, user_id, folder_path):
         current_path += "/{}".format(part)
         check_url = (
             "https://graph.microsoft.com/v1.0/users/{}/drive/root:{}"
-            .format(user_id, current_path)
+            .format(ONEDRIVE_USER_EMAIL, current_path)
         )
         response = requests.get(check_url, headers=headers)
 
         if response.status_code == 404:
-            # Folder doesn't exist — create it
             parent_path = "/".join(current_path.split("/")[:-1]) or "/"
             if parent_path == "/":
                 parent_url = (
                     "https://graph.microsoft.com/v1.0/users/{}/drive/root/children"
-                    .format(user_id)
+                    .format(ONEDRIVE_USER_EMAIL)
                 )
             else:
                 parent_url = (
                     "https://graph.microsoft.com/v1.0/users/{}/drive/root:{}:/children"
-                    .format(user_id, parent_path)
+                    .format(ONEDRIVE_USER_EMAIL, parent_path)
                 )
             create_payload = {
                 "name":   part,
@@ -122,23 +92,25 @@ def ensure_folder(token, user_id, folder_path):
             response.raise_for_status()
 
 
-def upload_file(token, user_id, local_path, onedrive_folder):
+# ── UPLOAD ─────────────────────────────────────────────────
+
+def upload_file(token, local_path, onedrive_folder):
     """
-    Upload a single file to OneDrive using the Graph API upload session.
-    Handles files of any size using chunked upload.
+    Upload a single file to OneDrive using chunked upload session.
+    Handles files of any size.
     """
     filename    = Path(local_path).name
     remote_path = "{}/{}".format(onedrive_folder.rstrip("/"), filename)
     headers     = {"Authorization": "Bearer {}".format(token)}
+    file_size   = Path(local_path).stat().st_size
 
-    file_size = Path(local_path).stat().st_size
     print("Uploading {} ({:.1f} MB)...".format(
         filename, file_size / 1024 / 1024), flush=True)
 
-    # Create upload session for large files
+    # Create upload session
     session_url = (
         "https://graph.microsoft.com/v1.0/users/{}/drive/root:{}:/createUploadSession"
-        .format(user_id, remote_path)
+        .format(ONEDRIVE_USER_EMAIL, remote_path)
     )
     session_payload = {
         "item": {
@@ -155,8 +127,8 @@ def upload_file(token, user_id, local_path, onedrive_folder):
     upload_url = session_response.json()["uploadUrl"]
 
     # Upload in 10MB chunks
-    chunk_size  = 10 * 1024 * 1024
-    uploaded    = 0
+    chunk_size = 10 * 1024 * 1024
+    uploaded   = 0
 
     with open(local_path, "rb") as f:
         while True:
@@ -187,32 +159,39 @@ def upload_file(token, user_id, local_path, onedrive_folder):
 def main():
     print("\n" + "="*50)
     print("OneDrive Upload Started")
+    print("Target user:   {}".format(ONEDRIVE_USER_EMAIL))
     print("Target folder: {}".format(ONEDRIVE_FOLDER))
     print("="*50)
 
-    # Find CSV files to upload
-    csv_files = sorted(Path(".").glob("telemetry_*.csv"))
+    # Find CSV files to upload, skipping null/Unknown artifacts
+    all_csv   = sorted(Path(".").glob("telemetry_*.csv"))
+    csv_files = [f for f in all_csv if f.name not in SKIP_FILES]
+    skipped   = [f for f in all_csv if f.name in SKIP_FILES]
+
+    if skipped:
+        print("Skipping data quality files: {}".format(
+            [f.name for f in skipped]))
+
     if not csv_files:
-        print("No telemetry_*.csv files found — nothing to upload.")
+        print("No telemetry CSV files found to upload.")
         sys.exit(0)
 
-    print("Files to upload:")
+    print("\nFiles to upload:")
     for f in csv_files:
         size_mb = f.stat().st_size / 1024 / 1024
         print("  {} ({:.1f} MB)".format(f.name, size_mb))
 
     # Authenticate
-    token   = get_access_token()
-    user_id = get_user_id(token)
+    token = get_access_token()
 
     # Ensure target folder exists
-    ensure_folder(token, user_id, ONEDRIVE_FOLDER)
+    ensure_folder(token, ONEDRIVE_FOLDER)
 
     # Upload each file
     failed = []
     for csv_path in csv_files:
         try:
-            upload_file(token, user_id, str(csv_path), ONEDRIVE_FOLDER)
+            upload_file(token, str(csv_path), ONEDRIVE_FOLDER)
         except Exception as e:
             print("  ERROR uploading {}: {}".format(csv_path.name, e), flush=True)
             failed.append(csv_path.name)
@@ -225,7 +204,7 @@ def main():
         sys.exit(1)
     else:
         print("All files uploaded successfully to OneDrive!")
-        print("="*50)
+    print("="*50)
 
 
 if __name__ == "__main__":
