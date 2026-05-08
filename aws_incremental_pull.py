@@ -1,6 +1,3 @@
-# aws_incremental_pull.py
-
-```python
 import os
 import re
 import json
