@@ -23,7 +23,7 @@ S3_BUCKET_NAME = os.environ["S3_BUCKET_NAME"]
 S3_PREFIX = os.environ.get("S3_PREFIX", "")
 
 # ==========================================================
-# ONEDRIVE / AZURE SETTINGS
+# AZURE / ONEDRIVE SETTINGS
 # ==========================================================
 
 CLIENT_ID = os.environ["AZURE_CLIENT_ID"]
@@ -42,6 +42,9 @@ STATE_FILE = "aws_site_state.json"
 RETENTION_DAYS = 730
 MAX_RUN_SECONDS = 19800
 
+# Upload/save checkpoint every N processed files
+CHECKPOINT_INTERVAL = 100
+
 COLUMN_MAP = {
     "Data": "telemetryDate",
     "Position_a1_rad": "trackerCurrentAngle",
@@ -56,7 +59,6 @@ COLUMN_MAP = {
 # ==========================================================
 # MICROSOFT GRAPH AUTH
 # ==========================================================
-
 
 def get_graph_token():
 
@@ -82,7 +84,6 @@ def get_graph_token():
 # STATE MANAGEMENT
 # ==========================================================
 
-
 def load_state():
 
     if Path(STATE_FILE).exists():
@@ -94,7 +95,6 @@ def load_state():
         "sites": {}
     }
 
-
 def save_state(state):
 
     with open(STATE_FILE, "w") as f:
@@ -103,7 +103,6 @@ def save_state(state):
 # ==========================================================
 # AWS CLIENT
 # ==========================================================
-
 
 def get_s3_client():
 
@@ -118,11 +117,10 @@ def get_s3_client():
 # TIMESTAMP PARSING
 # ==========================================================
 
-
 def extract_timestamp_from_key(key):
 
     match = re.search(
-        r"(\d{4})_(\d{2})_(\d{2})_(\d{6})",
+        r"(\\d{4})_(\\d{2})_(\\d{2})_(\\d{6})",
         key
     )
 
@@ -145,7 +143,6 @@ def extract_timestamp_from_key(key):
         tzinfo=timezone.utc
     )
 
-
 def get_site_id_from_key(key):
 
     return key.split("/")[0]
@@ -153,7 +150,6 @@ def get_site_id_from_key(key):
 # ==========================================================
 # CSV PROCESSING
 # ==========================================================
-
 
 def process_s3_object(s3, key):
 
@@ -175,7 +171,6 @@ def process_s3_object(s3, key):
 
     return df
 
-
 def normalize_dataframe(df):
 
     df = df.rename(columns=COLUMN_MAP)
@@ -193,7 +188,6 @@ def normalize_dataframe(df):
 # ==========================================================
 # ONEDRIVE DOWNLOAD
 # ==========================================================
-
 
 def download_existing_csv(token, site_id):
 
@@ -234,7 +228,6 @@ def download_existing_csv(token, site_id):
 # ONEDRIVE UPLOAD
 # ==========================================================
 
-
 def upload_csv(token, local_path):
 
     filename = Path(local_path).name
@@ -267,13 +260,45 @@ def upload_csv(token, local_path):
     print(f"Uploaded {filename}")
 
 # ==========================================================
+# CHECKPOINT SAVE + UPLOAD
+# ==========================================================
+
+def checkpoint_upload(token, updated_sites, state):
+
+    print("\\n=== CHECKPOINT UPLOAD START ===")
+
+    for site_id in updated_sites:
+
+        local_csv = f"aws_telemetry_{site_id}.csv"
+
+        if Path(local_csv).exists():
+
+            try:
+
+                upload_csv(
+                    token,
+                    local_csv
+                )
+
+            except Exception as e:
+
+                print(
+                    f"ERROR uploading {local_csv}: {e}"
+                )
+
+    save_state(state)
+
+    print("State file saved")
+
+    print("=== CHECKPOINT COMPLETE ===\\n")
+
+# ==========================================================
 # MAIN
 # ==========================================================
 
-
 def main():
 
-    print("\n" + "=" * 50)
+    print("\\n" + "=" * 50)
     print("AWS Incremental Telemetry Pull")
     print("=" * 50)
 
@@ -311,9 +336,13 @@ def main():
 
             if elapsed >= MAX_RUN_SECONDS:
 
-                print("Stopping due to runtime limit")
+                print("\\nStopping due to runtime limit")
 
-                save_state(state)
+                checkpoint_upload(
+                    token,
+                    updated_sites,
+                    state
+                )
 
                 return
 
@@ -390,30 +419,41 @@ def main():
                     f"  Added {len(df):,} rows"
                 )
 
+                # ==========================================
+                # PERIODIC CHECKPOINT
+                # ==========================================
+
+                if (
+                    processed_files %
+                    CHECKPOINT_INTERVAL
+                ) == 0:
+
+                    checkpoint_upload(
+                        token,
+                        updated_sites,
+                        state
+                    )
+
             except Exception as e:
 
-                print(f"ERROR processing {key}: {e}")
+                print(
+                    f"ERROR processing {key}: {e}"
+                )
 
-    print("\nUploading updated CSVs...")
+    print("\\nFinal upload checkpoint...")
 
-    for site_id in updated_sites:
+    checkpoint_upload(
+        token,
+        updated_sites,
+        state
+    )
 
-        local_csv = f"aws_telemetry_{site_id}.csv"
-
-        upload_csv(
-            token,
-            local_csv
-        )
-
-    save_state(state)
-
-    print("\n" + "=" * 50)
+    print("\\n" + "=" * 50)
     print("Run complete")
     print(f"Files processed: {processed_files:,}")
     print(f"Rows added: {total_rows:,}")
     print(f"Sites updated: {len(updated_sites):,}")
     print("=" * 50)
-
 
 if __name__ == "__main__":
     main()
