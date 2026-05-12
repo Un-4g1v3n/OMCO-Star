@@ -42,7 +42,7 @@ STATE_FILE = "aws_site_state.json"
 RETENTION_DAYS = 730
 MAX_RUN_SECONDS = 19800
 
-# Upload/save checkpoint every N processed files
+# Upload/save every N processed files
 CHECKPOINT_INTERVAL = 100
 
 COLUMN_MAP = {
@@ -74,7 +74,11 @@ def get_graph_token():
         "scope": "https://graph.microsoft.com/.default"
     }
 
-    response = requests.post(url, data=payload)
+    response = requests.post(
+        url,
+        data=payload,
+        timeout=30
+    )
 
     response.raise_for_status()
 
@@ -210,7 +214,8 @@ def download_existing_csv(token, site_id):
 
     response = requests.get(
         url,
-        headers=headers
+        headers=headers,
+        timeout=120
     )
 
     if response.status_code == 200:
@@ -218,7 +223,10 @@ def download_existing_csv(token, site_id):
         with open(local_file, "wb") as f:
             f.write(response.content)
 
-        print(f"Downloaded existing CSV for {site_id}")
+        print(
+            f"Downloaded existing CSV for {site_id}",
+            flush=True
+        )
 
         return True
 
@@ -252,12 +260,13 @@ def upload_csv(token, local_path):
         response = requests.put(
             upload_url,
             headers=headers,
-            data=f
+            data=f,
+            timeout=600
         )
 
     response.raise_for_status()
 
-    print(f"Uploaded {filename}")
+    print(f"Uploaded {filename}", flush=True)
 
 # ==========================================================
 # CHECKPOINT SAVE + UPLOAD
@@ -265,7 +274,10 @@ def upload_csv(token, local_path):
 
 def checkpoint_upload(token, updated_sites, state):
 
-    print("\\n=== CHECKPOINT UPLOAD START ===")
+    print(
+        "\\n=== CHECKPOINT UPLOAD START ===",
+        flush=True
+    )
 
     for site_id in updated_sites:
 
@@ -283,14 +295,21 @@ def checkpoint_upload(token, updated_sites, state):
             except Exception as e:
 
                 print(
-                    f"ERROR uploading {local_csv}: {e}"
+                    f"ERROR uploading {local_csv}: {e}",
+                    flush=True
                 )
 
     save_state(state)
 
-    print("State file saved")
+    print(
+        "State file saved",
+        flush=True
+    )
 
-    print("=== CHECKPOINT COMPLETE ===\\n")
+    print(
+        "=== CHECKPOINT COMPLETE ===\\n",
+        flush=True
+    )
 
 # ==========================================================
 # MAIN
@@ -298,9 +317,9 @@ def checkpoint_upload(token, updated_sites, state):
 
 def main():
 
-    print("\\n" + "=" * 50)
-    print("AWS Incremental Telemetry Pull")
-    print("=" * 50)
+    print("\\n" + "=" * 50, flush=True)
+    print("AWS Incremental Telemetry Pull", flush=True)
+    print("=" * 50, flush=True)
 
     start_time = time.time()
 
@@ -309,24 +328,54 @@ def main():
         - timedelta(days=RETENTION_DAYS)
     )
 
-    print(f"Retention cutoff: {cutoff_date}")
+    print(
+        f"Retention cutoff: {cutoff_date}",
+        flush=True
+    )
+
+    print("Loading state file...", flush=True)
 
     state = load_state()
 
+    print("State file loaded", flush=True)
+
+    print("Getting Microsoft Graph token...", flush=True)
+
     token = get_graph_token()
+
+    print("Graph token acquired", flush=True)
+
+    print("Creating S3 client...", flush=True)
 
     s3 = get_s3_client()
 
+    print("S3 client created", flush=True)
+
+    print("Creating paginator...", flush=True)
+
     paginator = s3.get_paginator("list_objects_v2")
+
+    print("Paginator created", flush=True)
+
+    print("Starting S3 pagination...", flush=True)
 
     total_rows = 0
     processed_files = 0
     updated_sites = set()
 
+    page_number = 0
+
     for page in paginator.paginate(
         Bucket=S3_BUCKET_NAME,
         Prefix=S3_PREFIX
     ):
+
+        page_number += 1
+
+        print(
+            f"Loaded S3 page {page_number}",
+            flush=True
+        )
 
         contents = page.get("Contents", [])
 
@@ -336,7 +385,10 @@ def main():
 
             if elapsed >= MAX_RUN_SECONDS:
 
-                print("\\nStopping due to runtime limit")
+                print(
+                    "\\nStopping due to runtime limit",
+                    flush=True
+                )
 
                 checkpoint_upload(
                     token,
@@ -358,8 +410,16 @@ def main():
             if not file_timestamp:
                 continue
 
+            # ==================================================
+            # 2-YEAR RETENTION FILTER
+            # ==================================================
+
             if file_timestamp < cutoff_date:
                 continue
+
+            # ==================================================
+            # INCREMENTAL FILTER
+            # ==================================================
 
             last_processed_str = state["sites"].get(site_id)
 
@@ -384,7 +444,10 @@ def main():
                     site_id
                 )
 
-            print(f"Processing: {key}")
+            print(
+                f"Processing: {key}",
+                flush=True
+            )
 
             try:
 
@@ -416,12 +479,13 @@ def main():
                 )
 
                 print(
-                    f"  Added {len(df):,} rows"
+                    f"  Added {len(df):,} rows",
+                    flush=True
                 )
 
-                # ==========================================
-                # PERIODIC CHECKPOINT
-                # ==========================================
+                # ==============================================
+                # PERIODIC CHECKPOINT UPLOAD
+                # ==============================================
 
                 if (
                     processed_files %
@@ -437,10 +501,14 @@ def main():
             except Exception as e:
 
                 print(
-                    f"ERROR processing {key}: {e}"
+                    f"ERROR processing {key}: {e}",
+                    flush=True
                 )
 
-    print("\\nFinal upload checkpoint...")
+    print(
+        "\\nFinal upload checkpoint...",
+        flush=True
+    )
 
     checkpoint_upload(
         token,
@@ -448,12 +516,21 @@ def main():
         state
     )
 
-    print("\\n" + "=" * 50)
-    print("Run complete")
-    print(f"Files processed: {processed_files:,}")
-    print(f"Rows added: {total_rows:,}")
-    print(f"Sites updated: {len(updated_sites):,}")
-    print("=" * 50)
+    print("\\n" + "=" * 50, flush=True)
+    print("Run complete", flush=True)
+    print(
+        f"Files processed: {processed_files:,}",
+        flush=True
+    )
+    print(
+        f"Rows added: {total_rows:,}",
+        flush=True
+    )
+    print(
+        f"Sites updated: {len(updated_sites):,}",
+        flush=True
+    )
+    print("=" * 50, flush=True)
 
 if __name__ == "__main__":
     main()
