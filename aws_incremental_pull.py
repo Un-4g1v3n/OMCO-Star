@@ -58,7 +58,7 @@ COLUMN_MAP = {
 }
 
 # ==========================================================
-# GRAPH AUTH
+# GRAPH TOKEN
 # ==========================================================
 
 def get_graph_token():
@@ -261,7 +261,10 @@ def upload_csv(token, local_path):
 
     response.raise_for_status()
 
-    print(f"Uploaded {filename}", flush=True)
+    print(
+        f"Uploaded {filename}",
+        flush=True
+    )
 
 # ==========================================================
 # CHECKPOINT SAVE + UPLOAD
@@ -318,11 +321,6 @@ def get_site_prefixes(s3):
 
     prefixes = []
 
-    print(
-        "Loading site prefixes...",
-        flush=True
-    )
-
     for page in paginator.paginate(
         Bucket=S3_BUCKET_NAME,
         Delimiter="/"
@@ -333,12 +331,9 @@ def get_site_prefixes(s3):
             []
         ):
 
-            prefixes.append(prefix["Prefix"])
-
-    print(
-        f"Found {len(prefixes)} site prefixes",
-        flush=True
-    )
+            prefixes.append(
+                prefix["Prefix"]
+            )
 
     return prefixes
 
@@ -375,13 +370,23 @@ def main():
     updated_sites = set()
 
     # ======================================================
-    # LOAD SITE PREFIXES ONLY
+    # GET SITE PREFIXES
     # ======================================================
+
+    print(
+        "Loading site prefixes...",
+        flush=True
+    )
 
     site_prefixes = get_site_prefixes(s3)
 
+    print(
+        f"Found {len(site_prefixes)} site prefixes",
+        flush=True
+    )
+
     # ======================================================
-    # PROCESS EACH SITE INDIVIDUALLY
+    # PROCESS EACH SITE
     # ======================================================
 
     for site_prefix in site_prefixes:
@@ -410,7 +415,13 @@ def main():
             flush=True
         )
 
-        local_csv = f"aws_telemetry_{site_id}.csv"
+        local_csv = (
+            f"aws_telemetry_{site_id}.csv"
+        )
+
+        # ==================================================
+        # DOWNLOAD EXISTING CSV
+        # ==================================================
 
         if not Path(local_csv).exists():
 
@@ -418,6 +429,10 @@ def main():
                 token,
                 site_id
             )
+
+        # ==================================================
+        # GET LAST PROCESSED TIME
+        # ==================================================
 
         last_processed_str = (
             state["sites"].get(site_id)
@@ -435,14 +450,15 @@ def main():
 
             last_processed = cutoff_date
 
-        effective_cutoff = max(
-            cutoff_date,
-            last_processed
-        )
+        # ==================================================
+        # PROCESS S3 FILES
+        # ==================================================
 
         paginator = s3.get_paginator(
             "list_objects_v2"
         )
+
+        file_counter = 0
 
         for page in paginator.paginate(
             Bucket=S3_BUCKET_NAME,
@@ -456,7 +472,9 @@ def main():
 
             for obj in contents:
 
-                elapsed = time.time() - start_time
+                elapsed = (
+                    time.time() - start_time
+                )
 
                 if elapsed >= MAX_RUN_SECONDS:
 
@@ -486,11 +504,20 @@ def main():
                     continue
 
                 # ==========================================
-                # OPTIMIZED FILTER
+                # 2 YEAR FILTER
                 # ==========================================
 
-                if file_timestamp <= effective_cutoff:
+                if file_timestamp < cutoff_date:
                     continue
+
+                # ==========================================
+                # INCREMENTAL FILTER
+                # ==========================================
+
+                if file_timestamp <= last_processed:
+                    continue
+
+                file_counter += 1
 
                 print(
                     f"Processing: {key}",
@@ -524,6 +551,10 @@ def main():
 
                     updated_sites.add(site_id)
 
+                    # ======================================
+                    # UPDATE CHECKPOINT
+                    # ======================================
+
                     state["sites"][site_id] = (
                         file_timestamp.isoformat()
                     )
@@ -554,6 +585,11 @@ def main():
                         f"ERROR processing {key}: {e}",
                         flush=True
                     )
+
+        print(
+            f"Processed {file_counter} files for site",
+            flush=True
+        )
 
     # ======================================================
     # FINAL CHECKPOINT
