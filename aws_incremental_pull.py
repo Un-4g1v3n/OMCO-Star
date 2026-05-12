@@ -20,8 +20,6 @@ AWS_SECRET_ACCESS_KEY = os.environ["AWS_SECRET_ACCESS_KEY"]
 AWS_REGION = os.environ["AWS_REGION"]
 S3_BUCKET_NAME = os.environ["S3_BUCKET_NAME"]
 
-S3_PREFIX = os.environ.get("S3_PREFIX", "")
-
 # ==========================================================
 # AZURE / ONEDRIVE SETTINGS
 # ==========================================================
@@ -42,8 +40,11 @@ STATE_FILE = "aws_site_state.json"
 RETENTION_DAYS = 730
 MAX_RUN_SECONDS = 19800
 
-# Upload/save every N processed files
 CHECKPOINT_INTERVAL = 100
+
+# ==========================================================
+# COLUMN MAP
+# ==========================================================
 
 COLUMN_MAP = {
     "Data": "telemetryDate",
@@ -57,7 +58,7 @@ COLUMN_MAP = {
 }
 
 # ==========================================================
-# MICROSOFT GRAPH AUTH
+# GRAPH AUTH
 # ==========================================================
 
 def get_graph_token():
@@ -95,9 +96,7 @@ def load_state():
         with open(STATE_FILE, "r") as f:
             return json.load(f)
 
-    return {
-        "sites": {}
-    }
+    return {"sites": {}}
 
 def save_state(state):
 
@@ -118,7 +117,7 @@ def get_s3_client():
     )
 
 # ==========================================================
-# TIMESTAMP PARSING
+# TIMESTAMP EXTRACTION
 # ==========================================================
 
 def extract_timestamp_from_key(key):
@@ -133,17 +132,13 @@ def extract_timestamp_from_key(key):
 
     year, month, day, hhmmss = match.groups()
 
-    hour = hhmmss[0:2]
-    minute = hhmmss[2:4]
-    second = hhmmss[4:6]
-
     return datetime(
         int(year),
         int(month),
         int(day),
-        int(hour),
-        int(minute),
-        int(second),
+        int(hhmmss[0:2]),
+        int(hhmmss[2:4]),
+        int(hhmmss[4:6]),
         tzinfo=timezone.utc
     )
 
@@ -312,6 +307,42 @@ def checkpoint_upload(token, updated_sites, state):
     )
 
 # ==========================================================
+# GET SITE PREFIXES
+# ==========================================================
+
+def get_site_prefixes(s3):
+
+    paginator = s3.get_paginator(
+        "list_objects_v2"
+    )
+
+    prefixes = []
+
+    print(
+        "Loading site prefixes...",
+        flush=True
+    )
+
+    for page in paginator.paginate(
+        Bucket=S3_BUCKET_NAME,
+        Delimiter="/"
+    ):
+
+        for prefix in page.get(
+            "CommonPrefixes",
+            []
+        ):
+
+            prefixes.append(prefix["Prefix"])
+
+    print(
+        f"Found {len(prefixes)} site prefixes",
+        flush=True
+    )
+
+    return prefixes
+
+# ==========================================================
 # MAIN
 # ==========================================================
 
@@ -333,164 +364,106 @@ def main():
         flush=True
     )
 
-    print("Loading state file...", flush=True)
-
     state = load_state()
-
-    print("State file loaded", flush=True)
-
-    print("Getting Microsoft Graph token...", flush=True)
 
     token = get_graph_token()
 
-    print("Graph token acquired", flush=True)
-
-    print("Creating S3 client...", flush=True)
-
     s3 = get_s3_client()
-
-    print("S3 client created", flush=True)
-
-    print("Creating paginator...", flush=True)
-
-    paginator = s3.get_paginator("list_objects_v2")
-
-    print("Paginator created", flush=True)
-
-    print("Starting S3 pagination...", flush=True)
 
     total_rows = 0
     processed_files = 0
     updated_sites = set()
 
-    page_number = 0
+    # ======================================================
+    # LOAD SITE PREFIXES ONLY
+    # ======================================================
 
-    for page in paginator.paginate(
-        Bucket=S3_BUCKET_NAME,
-        Prefix=S3_PREFIX
-    ):
+    site_prefixes = get_site_prefixes(s3)
 
-        page_number += 1
+    # ======================================================
+    # PROCESS EACH SITE INDIVIDUALLY
+    # ======================================================
 
-        print(
-            f"Loaded S3 page {page_number}",
-            flush=True
-        )
+    for site_prefix in site_prefixes:
 
-        contents = page.get("Contents", [])
+        elapsed = time.time() - start_time
 
-        for obj in contents:
-
-            elapsed = time.time() - start_time
-
-            if elapsed >= MAX_RUN_SECONDS:
-
-                print(
-                    "\\nStopping due to runtime limit",
-                    flush=True
-                )
-
-                checkpoint_upload(
-                    token,
-                    updated_sites,
-                    state
-                )
-
-                return
-
-            key = obj["Key"]
-
-            if not key.endswith(".csv.gz"):
-                continue
-
-            site_id = get_site_id_from_key(key)
-
-            file_timestamp = extract_timestamp_from_key(key)
-
-            if not file_timestamp:
-                continue
-
-            # ==================================================
-            # 2-YEAR RETENTION FILTER
-            # ==================================================
-
-            if file_timestamp < cutoff_date:
-                continue
-
-            # ==================================================
-            # INCREMENTAL FILTER
-            # ==================================================
-
-            last_processed_str = state["sites"].get(site_id)
-
-            if last_processed_str:
-
-                last_processed = datetime.fromisoformat(
-                    last_processed_str
-                )
-
-                if file_timestamp <= last_processed:
-                    continue
-
-            local_csv = f"aws_telemetry_{site_id}.csv"
-
-            if (
-                site_id not in updated_sites and
-                not Path(local_csv).exists()
-            ):
-
-                download_existing_csv(
-                    token,
-                    site_id
-                )
+        if elapsed >= MAX_RUN_SECONDS:
 
             print(
-                f"Processing: {key}",
+                "Stopping due to runtime limit",
                 flush=True
             )
 
-            try:
+            checkpoint_upload(
+                token,
+                updated_sites,
+                state
+            )
 
-                df = process_s3_object(
-                    s3,
-                    key
+            return
+
+        site_id = site_prefix.rstrip("/")
+
+        print(
+            f"\\nProcessing site: {site_id}",
+            flush=True
+        )
+
+        local_csv = f"aws_telemetry_{site_id}.csv"
+
+        if not Path(local_csv).exists():
+
+            download_existing_csv(
+                token,
+                site_id
+            )
+
+        last_processed_str = (
+            state["sites"].get(site_id)
+        )
+
+        if last_processed_str:
+
+            last_processed = (
+                datetime.fromisoformat(
+                    last_processed_str
                 )
+            )
 
-                df["siteId"] = site_id
+        else:
 
-                df = normalize_dataframe(df)
+            last_processed = cutoff_date
 
-                file_exists = Path(local_csv).exists()
+        effective_cutoff = max(
+            cutoff_date,
+            last_processed
+        )
 
-                df.to_csv(
-                    local_csv,
-                    mode="a",
-                    header=not file_exists,
-                    index=False
-                )
+        paginator = s3.get_paginator(
+            "list_objects_v2"
+        )
 
-                total_rows += len(df)
-                processed_files += 1
+        for page in paginator.paginate(
+            Bucket=S3_BUCKET_NAME,
+            Prefix=site_prefix
+        ):
 
-                updated_sites.add(site_id)
+            contents = page.get(
+                "Contents",
+                []
+            )
 
-                state["sites"][site_id] = (
-                    file_timestamp.isoformat()
-                )
+            for obj in contents:
 
-                print(
-                    f"  Added {len(df):,} rows",
-                    flush=True
-                )
+                elapsed = time.time() - start_time
 
-                # ==============================================
-                # PERIODIC CHECKPOINT UPLOAD
-                # ==============================================
+                if elapsed >= MAX_RUN_SECONDS:
 
-                if (
-                    processed_files %
-                    CHECKPOINT_INTERVAL
-                ) == 0:
+                    print(
+                        "Stopping due to runtime limit",
+                        flush=True
+                    )
 
                     checkpoint_upload(
                         token,
@@ -498,17 +471,93 @@ def main():
                         state
                     )
 
-            except Exception as e:
+                    return
+
+                key = obj["Key"]
+
+                if not key.endswith(".csv.gz"):
+                    continue
+
+                file_timestamp = (
+                    extract_timestamp_from_key(key)
+                )
+
+                if not file_timestamp:
+                    continue
+
+                # ==========================================
+                # OPTIMIZED FILTER
+                # ==========================================
+
+                if file_timestamp <= effective_cutoff:
+                    continue
 
                 print(
-                    f"ERROR processing {key}: {e}",
+                    f"Processing: {key}",
                     flush=True
                 )
 
-    print(
-        "\\nFinal upload checkpoint...",
-        flush=True
-    )
+                try:
+
+                    df = process_s3_object(
+                        s3,
+                        key
+                    )
+
+                    df["siteId"] = site_id
+
+                    df = normalize_dataframe(df)
+
+                    file_exists = (
+                        Path(local_csv).exists()
+                    )
+
+                    df.to_csv(
+                        local_csv,
+                        mode="a",
+                        header=not file_exists,
+                        index=False
+                    )
+
+                    total_rows += len(df)
+                    processed_files += 1
+
+                    updated_sites.add(site_id)
+
+                    state["sites"][site_id] = (
+                        file_timestamp.isoformat()
+                    )
+
+                    print(
+                        f"  Added {len(df):,} rows",
+                        flush=True
+                    )
+
+                    # ======================================
+                    # PERIODIC CHECKPOINT
+                    # ======================================
+
+                    if (
+                        processed_files %
+                        CHECKPOINT_INTERVAL
+                    ) == 0:
+
+                        checkpoint_upload(
+                            token,
+                            updated_sites,
+                            state
+                        )
+
+                except Exception as e:
+
+                    print(
+                        f"ERROR processing {key}: {e}",
+                        flush=True
+                    )
+
+    # ======================================================
+    # FINAL CHECKPOINT
+    # ======================================================
 
     checkpoint_upload(
         token,
@@ -518,18 +567,22 @@ def main():
 
     print("\\n" + "=" * 50, flush=True)
     print("Run complete", flush=True)
+
     print(
         f"Files processed: {processed_files:,}",
         flush=True
     )
+
     print(
         f"Rows added: {total_rows:,}",
         flush=True
     )
+
     print(
         f"Sites updated: {len(updated_sites):,}",
         flush=True
     )
+
     print("=" * 50, flush=True)
 
 if __name__ == "__main__":
