@@ -40,7 +40,10 @@ STATE_FILE = "aws_site_state.json"
 RETENTION_DAYS = 730
 MAX_RUN_SECONDS = 19800
 
-CHECKPOINT_INTERVAL = 100
+CHECKPOINT_INTERVAL = 50
+
+# 200MB safety limit
+MAX_CSV_SIZE_BYTES = 200 * 1024 * 1024
 
 # ==========================================================
 # COLUMN MAP
@@ -119,6 +122,7 @@ def get_s3_client():
 # ==========================================================
 # TIMESTAMP EXTRACTION
 # ==========================================================
+
 def extract_timestamp_from_key(key):
 
     match = re.search(
@@ -140,10 +144,6 @@ def extract_timestamp_from_key(key):
         int(hhmmss[4:6]),
         tzinfo=timezone.utc
     )
-
-def get_site_id_from_key(key):
-
-    return key.split("/")[0]
 
 # ==========================================================
 # CSV PROCESSING
@@ -184,47 +184,71 @@ def normalize_dataframe(df):
     return df
 
 # ==========================================================
+# FILE ROTATION
+# ==========================================================
+
+def get_active_csv(site_id):
+
+    file_index = 1
+
+    while True:
+
+        filename = (
+            f"aws_telemetry_{site_id}_F{file_index}.csv"
+        )
+
+        path = Path(filename)
+
+        if not path.exists():
+            return filename
+
+        if path.stat().st_size < MAX_CSV_SIZE_BYTES:
+            return filename
+
+        file_index += 1
+
+# ==========================================================
 # ONEDRIVE DOWNLOAD
 # ==========================================================
 
-def download_existing_csv(token, site_id):
+def download_existing_csvs(token, site_id):
 
-    local_file = f"aws_telemetry_{site_id}.csv"
+    for i in range(1, 100):
 
-    remote_path = (
-        f"{ONEDRIVE_FOLDER}/"
-        f"aws_telemetry_{site_id}.csv"
-    )
+        filename = (
+            f"aws_telemetry_{site_id}_F{i}.csv"
+        )
 
-    url = (
-        f"https://graph.microsoft.com/v1.0/"
-        f"users/{ONEDRIVE_USER_EMAIL}"
-        f"/drive/root:{remote_path}:/content"
-    )
+        remote_path = (
+            f"{ONEDRIVE_FOLDER}/{filename}"
+        )
 
-    headers = {
-        "Authorization": f"Bearer {token}"
-    }
+        url = (
+            f"https://graph.microsoft.com/v1.0/"
+            f"users/{ONEDRIVE_USER_EMAIL}"
+            f"/drive/root:{remote_path}:/content"
+        )
 
-    response = requests.get(
-        url,
-        headers=headers,
-        timeout=120
-    )
+        headers = {
+            "Authorization": f"Bearer {token}"
+        }
 
-    if response.status_code == 200:
+        response = requests.get(
+            url,
+            headers=headers,
+            timeout=120
+        )
 
-        with open(local_file, "wb") as f:
+        if response.status_code != 200:
+            break
+
+        with open(filename, "wb") as f:
             f.write(response.content)
 
         print(
-            f"Downloaded existing CSV for {site_id}",
+            f"Downloaded {filename}",
             flush=True
         )
-
-        return True
-
-    return False
 
 # ==========================================================
 # ONEDRIVE UPLOAD
@@ -266,35 +290,66 @@ def upload_csv(token, local_path):
     )
 
 # ==========================================================
-# CHECKPOINT SAVE + UPLOAD
+# SAFE CHECKPOINT
 # ==========================================================
 
-def checkpoint_upload(token, updated_sites, state):
+def checkpoint_upload(
+    token,
+    updated_sites,
+    state,
+    pending_state_updates
+):
 
     print(
         "\\n=== CHECKPOINT UPLOAD START ===",
         flush=True
     )
 
+    successful_sites = set()
+
     for site_id in updated_sites:
 
-        local_csv = f"aws_telemetry_{site_id}.csv"
+        try:
 
-        if Path(local_csv).exists():
+            uploaded_any = False
 
-            try:
+            for i in range(1, 100):
+
+                filename = (
+                    f"aws_telemetry_{site_id}_F{i}.csv"
+                )
+
+                if not Path(filename).exists():
+                    break
 
                 upload_csv(
                     token,
-                    local_csv
+                    filename
                 )
 
-            except Exception as e:
+                uploaded_any = True
 
-                print(
-                    f"ERROR uploading {local_csv}: {e}",
-                    flush=True
-                )
+            if uploaded_any:
+                successful_sites.add(site_id)
+
+        except Exception as e:
+
+            print(
+                f"ERROR uploading site {site_id}: {e}",
+                flush=True
+            )
+
+    # ======================================================
+    # ONLY ADVANCE STATE AFTER SUCCESSFUL UPLOAD
+    # ======================================================
+
+    for site_id in successful_sites:
+
+        if site_id in pending_state_updates:
+
+            state["sites"][site_id] = (
+                pending_state_updates[site_id]
+            )
 
     save_state(state)
 
@@ -360,6 +415,8 @@ def main():
 
     state = load_state()
 
+    pending_state_updates = {}
+
     token = get_graph_token()
 
     s3 = get_s3_client()
@@ -367,10 +424,6 @@ def main():
     total_rows = 0
     processed_files = 0
     updated_sites = set()
-
-    # ======================================================
-    # GET SITE PREFIXES
-    # ======================================================
 
     print(
         "Loading site prefixes...",
@@ -383,10 +436,6 @@ def main():
         f"Found {len(site_prefixes)} site prefixes",
         flush=True
     )
-
-    # ======================================================
-    # PROCESS EACH SITE
-    # ======================================================
 
     for site_prefix in site_prefixes:
 
@@ -402,7 +451,8 @@ def main():
             checkpoint_upload(
                 token,
                 updated_sites,
-                state
+                state,
+                pending_state_updates
             )
 
             return
@@ -414,24 +464,10 @@ def main():
             flush=True
         )
 
-        local_csv = (
-            f"aws_telemetry_{site_id}.csv"
+        download_existing_csvs(
+            token,
+            site_id
         )
-
-        # ==================================================
-        # DOWNLOAD EXISTING CSV
-        # ==================================================
-
-        if not Path(local_csv).exists():
-
-            download_existing_csv(
-                token,
-                site_id
-            )
-
-        # ==================================================
-        # GET LAST PROCESSED TIME
-        # ==================================================
 
         last_processed_str = (
             state["sites"].get(site_id)
@@ -448,10 +484,6 @@ def main():
         else:
 
             last_processed = cutoff_date
-
-        # ==================================================
-        # PROCESS S3 FILES
-        # ==================================================
 
         paginator = s3.get_paginator(
             "list_objects_v2"
@@ -485,7 +517,8 @@ def main():
                     checkpoint_upload(
                         token,
                         updated_sites,
-                        state
+                        state,
+                        pending_state_updates
                     )
 
                     return
@@ -502,16 +535,8 @@ def main():
                 if not file_timestamp:
                     continue
 
-                # ==========================================
-                # 2 YEAR FILTER
-                # ==========================================
-
                 if file_timestamp < cutoff_date:
                     continue
-
-                # ==========================================
-                # INCREMENTAL FILTER
-                # ==========================================
 
                 if file_timestamp <= last_processed:
                     continue
@@ -534,12 +559,16 @@ def main():
 
                     df = normalize_dataframe(df)
 
+                    active_csv = get_active_csv(
+                        site_id
+                    )
+
                     file_exists = (
-                        Path(local_csv).exists()
+                        Path(active_csv).exists()
                     )
 
                     df.to_csv(
-                        local_csv,
+                        active_csv,
                         mode="a",
                         header=not file_exists,
                         index=False
@@ -550,22 +579,15 @@ def main():
 
                     updated_sites.add(site_id)
 
-                    # ======================================
-                    # UPDATE CHECKPOINT
-                    # ======================================
-
-                    state["sites"][site_id] = (
-                        file_timestamp.isoformat()
-                    )
+                    pending_state_updates[
+                        site_id
+                    ] = file_timestamp.isoformat()
 
                     print(
-                        f"  Added {len(df):,} rows",
+                        f"  Added {len(df):,} rows "
+                        f"to {active_csv}",
                         flush=True
                     )
-
-                    # ======================================
-                    # PERIODIC CHECKPOINT
-                    # ======================================
 
                     if (
                         processed_files %
@@ -575,7 +597,8 @@ def main():
                         checkpoint_upload(
                             token,
                             updated_sites,
-                            state
+                            state,
+                            pending_state_updates
                         )
 
                 except Exception as e:
@@ -590,14 +613,11 @@ def main():
             flush=True
         )
 
-    # ======================================================
-    # FINAL CHECKPOINT
-    # ======================================================
-
     checkpoint_upload(
         token,
         updated_sites,
-        state
+        state,
+        pending_state_updates
     )
 
     print("\\n" + "=" * 50, flush=True)
