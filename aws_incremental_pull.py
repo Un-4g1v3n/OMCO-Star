@@ -40,9 +40,9 @@ STATE_FILE = "aws_site_state.json"
 RETENTION_DAYS = 730
 MAX_RUN_SECONDS = 19800
 
-CHECKPOINT_INTERVAL = 50
+CHECKPOINT_INTERVAL = 25
 
-# 200MB safety limit
+# 200MB max per CSV part
 MAX_CSV_SIZE_BYTES = 200 * 1024 * 1024
 
 # ==========================================================
@@ -61,7 +61,7 @@ COLUMN_MAP = {
 }
 
 # ==========================================================
-# GRAPH TOKEN
+# TOKEN
 # ==========================================================
 
 def get_graph_token():
@@ -89,7 +89,7 @@ def get_graph_token():
     return response.json()["access_token"]
 
 # ==========================================================
-# STATE MANAGEMENT
+# STATE
 # ==========================================================
 
 def load_state():
@@ -120,7 +120,7 @@ def get_s3_client():
     )
 
 # ==========================================================
-# TIMESTAMP EXTRACTION
+# TIMESTAMP
 # ==========================================================
 
 def extract_timestamp_from_key(key):
@@ -189,12 +189,12 @@ def normalize_dataframe(df):
 
 def get_active_csv(site_id):
 
-    file_index = 1
+    index = 1
 
     while True:
 
         filename = (
-            f"aws_telemetry_{site_id}_F{file_index}.csv"
+            f"aws_telemetry_{site_id}_F{index}.csv"
         )
 
         path = Path(filename)
@@ -205,7 +205,7 @@ def get_active_csv(site_id):
         if path.stat().st_size < MAX_CSV_SIZE_BYTES:
             return filename
 
-        file_index += 1
+        index += 1
 
 # ==========================================================
 # ONEDRIVE DOWNLOAD
@@ -301,7 +301,7 @@ def checkpoint_upload(
 ):
 
     print(
-        "\\n=== CHECKPOINT UPLOAD START ===",
+        "\n=== CHECKPOINT UPLOAD START ===",
         flush=True
     )
 
@@ -359,12 +359,12 @@ def checkpoint_upload(
     )
 
     print(
-        "=== CHECKPOINT COMPLETE ===\\n",
+        "=== CHECKPOINT COMPLETE ===\n",
         flush=True
     )
 
 # ==========================================================
-# GET SITE PREFIXES
+# SITE PREFIXES
 # ==========================================================
 
 def get_site_prefixes(s3):
@@ -397,7 +397,7 @@ def get_site_prefixes(s3):
 
 def main():
 
-    print("\\n" + "=" * 50, flush=True)
+    print("\n" + "=" * 50, flush=True)
     print("AWS Incremental Telemetry Pull", flush=True)
     print("=" * 50, flush=True)
 
@@ -416,8 +416,6 @@ def main():
     state = load_state()
 
     pending_state_updates = {}
-
-    token = get_graph_token()
 
     s3 = get_s3_client()
 
@@ -448,6 +446,8 @@ def main():
                 flush=True
             )
 
+            token = get_graph_token()
+
             checkpoint_upload(
                 token,
                 updated_sites,
@@ -460,9 +460,11 @@ def main():
         site_id = site_prefix.rstrip("/")
 
         print(
-            f"\\nProcessing site: {site_id}",
+            f"\nProcessing site: {site_id}",
             flush=True
         )
+
+        token = get_graph_token()
 
         download_existing_csvs(
             token,
@@ -514,6 +516,8 @@ def main():
                         flush=True
                     )
 
+                    token = get_graph_token()
+
                     checkpoint_upload(
                         token,
                         updated_sites,
@@ -535,8 +539,16 @@ def main():
                 if not file_timestamp:
                     continue
 
+                # ==========================================
+                # 2 YEAR RETENTION
+                # ==========================================
+
                 if file_timestamp < cutoff_date:
                     continue
+
+                # ==========================================
+                # INCREMENTAL FILTER
+                # ==========================================
 
                 if file_timestamp <= last_processed:
                     continue
@@ -589,10 +601,16 @@ def main():
                         flush=True
                     )
 
+                    # ======================================
+                    # PERIODIC CHECKPOINT
+                    # ======================================
+
                     if (
                         processed_files %
                         CHECKPOINT_INTERVAL
                     ) == 0:
+
+                        token = get_graph_token()
 
                         checkpoint_upload(
                             token,
@@ -613,6 +631,12 @@ def main():
             flush=True
         )
 
+    # ======================================================
+    # FINAL CHECKPOINT
+    # ======================================================
+
+    token = get_graph_token()
+
     checkpoint_upload(
         token,
         updated_sites,
@@ -620,7 +644,7 @@ def main():
         pending_state_updates
     )
 
-    print("\\n" + "=" * 50, flush=True)
+    print("\n" + "=" * 50, flush=True)
     print("Run complete", flush=True)
 
     print(
