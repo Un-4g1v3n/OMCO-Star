@@ -40,9 +40,9 @@ STATE_FILE = "aws_site_state.json"
 RETENTION_DAYS = 730
 MAX_RUN_SECONDS = 19800
 
-CHECKPOINT_INTERVAL = 100
+CHECKPOINT_INTERVAL = 25
 
-# 200MB max per CSV part
+# 200MB per CSV part
 MAX_CSV_SIZE_BYTES = 200 * 1024 * 1024
 
 # ==========================================================
@@ -99,7 +99,9 @@ def load_state():
         with open(STATE_FILE, "r") as f:
             return json.load(f)
 
-    return {"sites": {}}
+    return {
+        "sites": {}
+    }
 
 def save_state(state):
 
@@ -200,10 +202,10 @@ def get_active_csv(site_id):
         path = Path(filename)
 
         if not path.exists():
-            return filename
+            return filename, index
 
         if path.stat().st_size < MAX_CSV_SIZE_BYTES:
-            return filename
+            return filename, index
 
         index += 1
 
@@ -290,12 +292,12 @@ def upload_csv(token, local_path):
     )
 
 # ==========================================================
-# SAFE CHECKPOINT
+# CHECKPOINT
 # ==========================================================
 
 def checkpoint_upload(
     token,
-    updated_sites,
+    active_site_files,
     state,
     pending_state_updates
 ):
@@ -307,35 +309,21 @@ def checkpoint_upload(
 
     successful_sites = set()
 
-    for site_id in updated_sites:
+    for site_id, filename in active_site_files.items():
 
         try:
 
-            uploaded_any = False
+            upload_csv(
+                token,
+                filename
+            )
 
-            for i in range(1, 100):
-
-                filename = (
-                    f"aws_telemetry_{site_id}_F{i}.csv"
-                )
-
-                if not Path(filename).exists():
-                    break
-
-                upload_csv(
-                    token,
-                    filename
-                )
-
-                uploaded_any = True
-
-            if uploaded_any:
-                successful_sites.add(site_id)
+            successful_sites.add(site_id)
 
         except Exception as e:
 
             print(
-                f"ERROR uploading site {site_id}: {e}",
+                f"ERROR uploading {filename}: {e}",
                 flush=True
             )
 
@@ -417,11 +405,12 @@ def main():
 
     pending_state_updates = {}
 
+    active_site_files = {}
+
     s3 = get_s3_client()
 
     total_rows = 0
     processed_files = 0
-    updated_sites = set()
 
     print(
         "Loading site prefixes...",
@@ -450,7 +439,7 @@ def main():
 
             checkpoint_upload(
                 token,
-                updated_sites,
+                active_site_files,
                 state,
                 pending_state_updates
             )
@@ -493,6 +482,8 @@ def main():
 
         file_counter = 0
 
+        previous_active_index = None
+
         for page in paginator.paginate(
             Bucket=S3_BUCKET_NAME,
             Prefix=site_prefix
@@ -520,7 +511,7 @@ def main():
 
                     checkpoint_upload(
                         token,
-                        updated_sites,
+                        active_site_files,
                         state,
                         pending_state_updates
                     )
@@ -539,16 +530,16 @@ def main():
                 if not file_timestamp:
                     continue
 
-                # ==========================================
+                # ==================================================
                 # 2 YEAR RETENTION
-                # ==========================================
+                # ==================================================
 
                 if file_timestamp < cutoff_date:
                     continue
 
-                # ==========================================
+                # ==================================================
                 # INCREMENTAL FILTER
-                # ==========================================
+                # ==================================================
 
                 if file_timestamp <= last_processed:
                     continue
@@ -571,8 +562,41 @@ def main():
 
                     df = normalize_dataframe(df)
 
-                    active_csv = get_active_csv(
-                        site_id
+                    active_csv, active_index = (
+                        get_active_csv(site_id)
+                    )
+
+                    # ==============================================
+                    # ROLLOVER DETECTION
+                    # ==============================================
+
+                    if (
+                        previous_active_index is not None
+                        and active_index > previous_active_index
+                    ):
+
+                        finalized_file = (
+                            f"aws_telemetry_{site_id}"
+                            f"_F{previous_active_index}.csv"
+                        )
+
+                        print(
+                            f"Uploading finalized file "
+                            f"{finalized_file}",
+                            flush=True
+                        )
+
+                        token = get_graph_token()
+
+                        upload_csv(
+                            token,
+                            finalized_file
+                        )
+
+                    previous_active_index = active_index
+
+                    active_site_files[site_id] = (
+                        active_csv
                     )
 
                     file_exists = (
@@ -589,8 +613,6 @@ def main():
                     total_rows += len(df)
                     processed_files += 1
 
-                    updated_sites.add(site_id)
-
                     pending_state_updates[
                         site_id
                     ] = file_timestamp.isoformat()
@@ -601,9 +623,9 @@ def main():
                         flush=True
                     )
 
-                    # ======================================
+                    # ==============================================
                     # PERIODIC CHECKPOINT
-                    # ======================================
+                    # ==============================================
 
                     if (
                         processed_files %
@@ -614,7 +636,7 @@ def main():
 
                         checkpoint_upload(
                             token,
-                            updated_sites,
+                            active_site_files,
                             state,
                             pending_state_updates
                         )
@@ -639,7 +661,7 @@ def main():
 
     checkpoint_upload(
         token,
-        updated_sites,
+        active_site_files,
         state,
         pending_state_updates
     )
@@ -658,7 +680,7 @@ def main():
     )
 
     print(
-        f"Sites updated: {len(updated_sites):,}",
+        f"Sites updated: {len(active_site_files):,}",
         flush=True
     )
 
