@@ -41,8 +41,9 @@ RETENTION_DAYS = 730
 MAX_RUN_SECONDS = 19800
 
 CHECKPOINT_INTERVAL = 25
+STATE_SAVE_INTERVAL = 10
 
-# 200MB per CSV part
+# 200MB file rollover
 MAX_CSV_SIZE_BYTES = 200 * 1024 * 1024
 
 # ==========================================================
@@ -61,7 +62,7 @@ COLUMN_MAP = {
 }
 
 # ==========================================================
-# TOKEN
+# GRAPH TOKEN
 # ==========================================================
 
 def get_graph_token():
@@ -109,7 +110,7 @@ def save_state(state):
         json.dump(state, f, indent=2)
 
 # ==========================================================
-# AWS CLIENT
+# AWS
 # ==========================================================
 
 def get_s3_client():
@@ -122,7 +123,7 @@ def get_s3_client():
     )
 
 # ==========================================================
-# TIMESTAMP
+# TIMESTAMP EXTRACTION
 # ==========================================================
 
 def extract_timestamp_from_key(key):
@@ -210,7 +211,7 @@ def get_active_csv(site_id):
         index += 1
 
 # ==========================================================
-# ONEDRIVE DOWNLOAD
+# DOWNLOAD EXISTING CSV FILES
 # ==========================================================
 
 def download_existing_csvs(token, site_id):
@@ -253,7 +254,7 @@ def download_existing_csvs(token, site_id):
         )
 
 # ==========================================================
-# ONEDRIVE UPLOAD
+# UPLOAD CSV
 # ==========================================================
 
 def upload_csv(token, local_path):
@@ -292,22 +293,18 @@ def upload_csv(token, local_path):
     )
 
 # ==========================================================
-# CHECKPOINT
+# CHECKPOINT UPLOAD
 # ==========================================================
 
 def checkpoint_upload(
     token,
-    active_site_files,
-    state,
-    pending_state_updates
+    active_site_files
 ):
 
     print(
         "\n=== CHECKPOINT UPLOAD START ===",
         flush=True
     )
-
-    successful_sites = set()
 
     for site_id, filename in active_site_files.items():
 
@@ -318,33 +315,12 @@ def checkpoint_upload(
                 filename
             )
 
-            successful_sites.add(site_id)
-
         except Exception as e:
 
             print(
                 f"ERROR uploading {filename}: {e}",
                 flush=True
             )
-
-    # ======================================================
-    # ONLY ADVANCE STATE AFTER SUCCESSFUL UPLOAD
-    # ======================================================
-
-    for site_id in successful_sites:
-
-        if site_id in pending_state_updates:
-
-            state["sites"][site_id] = (
-                pending_state_updates[site_id]
-            )
-
-    save_state(state)
-
-    print(
-        "State file saved",
-        flush=True
-    )
 
     print(
         "=== CHECKPOINT COMPLETE ===\n",
@@ -403,8 +379,6 @@ def main():
 
     state = load_state()
 
-    pending_state_updates = {}
-
     active_site_files = {}
 
     s3 = get_s3_client()
@@ -439,10 +413,10 @@ def main():
 
             checkpoint_upload(
                 token,
-                active_site_files,
-                state,
-                pending_state_updates
+                active_site_files
             )
+
+            save_state(state)
 
             return
 
@@ -511,10 +485,10 @@ def main():
 
                     checkpoint_upload(
                         token,
-                        active_site_files,
-                        state,
-                        pending_state_updates
+                        active_site_files
                     )
+
+                    save_state(state)
 
                     return
 
@@ -531,7 +505,7 @@ def main():
                     continue
 
                 # ==================================================
-                # 2 YEAR RETENTION
+                # RETENTION FILTER
                 # ==================================================
 
                 if file_timestamp < cutoff_date:
@@ -588,10 +562,20 @@ def main():
 
                         token = get_graph_token()
 
-                        upload_csv(
-                            token,
-                            finalized_file
-                        )
+                        try:
+
+                            upload_csv(
+                                token,
+                                finalized_file
+                            )
+
+                        except Exception as e:
+
+                            print(
+                                f"ERROR uploading finalized "
+                                f"file: {e}",
+                                flush=True
+                            )
 
                     previous_active_index = active_index
 
@@ -613,9 +597,24 @@ def main():
                     total_rows += len(df)
                     processed_files += 1
 
-                    pending_state_updates[
-                        site_id
-                    ] = file_timestamp.isoformat()
+                    # ==============================================
+                    # IMMEDIATELY ADVANCE STATE
+                    # ==============================================
+
+                    state["sites"][site_id] = (
+                        file_timestamp.isoformat()
+                    )
+
+                    # ==============================================
+                    # PERIODIC STATE SAVE
+                    # ==============================================
+
+                    if (
+                        processed_files %
+                        STATE_SAVE_INTERVAL
+                    ) == 0:
+
+                        save_state(state)
 
                     print(
                         f"  Added {len(df):,} rows "
@@ -624,7 +623,7 @@ def main():
                     )
 
                     # ==============================================
-                    # PERIODIC CHECKPOINT
+                    # PERIODIC CHECKPOINT UPLOAD
                     # ==============================================
 
                     if (
@@ -636,10 +635,10 @@ def main():
 
                         checkpoint_upload(
                             token,
-                            active_site_files,
-                            state,
-                            pending_state_updates
+                            active_site_files
                         )
+
+                        save_state(state)
 
                 except Exception as e:
 
@@ -661,10 +660,10 @@ def main():
 
     checkpoint_upload(
         token,
-        active_site_files,
-        state,
-        pending_state_updates
+        active_site_files
     )
+
+    save_state(state)
 
     print("\n" + "=" * 50, flush=True)
     print("Run complete", flush=True)
