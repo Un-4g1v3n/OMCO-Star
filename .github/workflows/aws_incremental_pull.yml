@@ -33,15 +33,15 @@ jobs:
           ONEDRIVE_USER_EMAIL: ${{ secrets.ONEDRIVE_USER_EMAIL }}
         run: python aws_incremental_pull.py
 
-      - name: Commit updated state
+      - name: Commit updated AWS state
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
 
-          git pull --rebase origin main
-
           git add aws_site_state.json
 
           git diff --cached --quiet || git commit -m "Update AWS telemetry state"
+
+          git pull --rebase origin main
 
           git push
