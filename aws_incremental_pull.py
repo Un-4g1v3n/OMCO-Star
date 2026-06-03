@@ -40,10 +40,9 @@ STATE_FILE = "aws_site_state.json"
 RETENTION_DAYS = 730
 MAX_RUN_SECONDS = 19800
 
-CHECKPOINT_INTERVAL = 1000
-STATE_SAVE_INTERVAL = 500
+CHECKPOINT_INTERVAL = 100
+STATE_SAVE_INTERVAL = 25
 
-# 200MB file rollover
 MAX_CSV_SIZE_BYTES = 200 * 1024 * 1024
 
 # ==========================================================
@@ -257,7 +256,7 @@ def download_existing_csvs(token, site_id):
 # UPLOAD CSV
 # ==========================================================
 
-def upload_csv(token, local_path):
+def upload_csv(token, local_path, delete_after=False):
 
     filename = Path(local_path).name
 
@@ -276,21 +275,115 @@ def upload_csv(token, local_path):
         "Content-Type": "text/csv"
     }
 
-    with open(local_path, "rb") as f:
+    max_retries = 5
 
-        response = requests.put(
-            upload_url,
-            headers=headers,
-            data=f,
-            timeout=600
-        )
+    for attempt in range(max_retries):
 
-    response.raise_for_status()
+        try:
 
-    print(
-        f"Uploaded {filename}",
-        flush=True
+            with open(local_path, "rb") as f:
+
+                response = requests.put(
+                    upload_url,
+                    headers=headers,
+                    data=f,
+                    timeout=600
+                )
+
+            if response.status_code in [200, 201]:
+
+                print(
+                    f"Uploaded {filename}",
+                    flush=True
+                )
+
+                if delete_after:
+
+                    try:
+
+                        os.remove(local_path)
+
+                        print(
+                            f"Deleted local file "
+                            f"{filename}",
+                            flush=True
+                        )
+
+                    except Exception as delete_error:
+
+                        print(
+                            f"Could not delete "
+                            f"{filename}: {delete_error}",
+                            flush=True
+                        )
+
+                return
+
+            if response.status_code == 409:
+
+                wait_time = (attempt + 1) * 15
+
+                print(
+                    f"409 Conflict uploading "
+                    f"{filename}. "
+                    f"Retrying in {wait_time}s...",
+                    flush=True
+                )
+
+                time.sleep(wait_time)
+
+                continue
+
+            response.raise_for_status()
+
+        except Exception as e:
+
+            if attempt == max_retries - 1:
+                raise
+
+            wait_time = (attempt + 1) * 15
+
+            print(
+                f"Retry upload for {filename} "
+                f"in {wait_time}s due to: {e}",
+                flush=True
+            )
+
+            time.sleep(wait_time)
+
+    raise Exception(
+        f"Failed upload after retries: {filename}"
     )
+
+# ==========================================================
+# CLEANUP
+# ==========================================================
+
+def cleanup_old_site_files(site_id, active_filename):
+
+    for file in Path(".").glob(
+        f"aws_telemetry_{site_id}_F*.csv"
+    ):
+
+        if str(file) != active_filename:
+
+            try:
+
+                os.remove(file)
+
+                print(
+                    f"Cleaned up old file "
+                    f"{file.name}",
+                    flush=True
+                )
+
+            except Exception as e:
+
+                print(
+                    f"Could not remove "
+                    f"{file.name}: {e}",
+                    flush=True
+                )
 
 # ==========================================================
 # CHECKPOINT UPLOAD
@@ -307,6 +400,9 @@ def checkpoint_upload(
     )
 
     for site_id, filename in active_site_files.items():
+
+        if not Path(filename).exists():
+            continue
 
         try:
 
@@ -504,16 +600,8 @@ def main():
                 if not file_timestamp:
                     continue
 
-                # ==================================================
-                # RETENTION FILTER
-                # ==================================================
-
                 if file_timestamp < cutoff_date:
                     continue
-
-                # ==================================================
-                # INCREMENTAL FILTER
-                # ==================================================
 
                 if file_timestamp <= last_processed:
                     continue
@@ -540,10 +628,6 @@ def main():
                         get_active_csv(site_id)
                     )
 
-                    # ==============================================
-                    # ROLLOVER DETECTION
-                    # ==============================================
-
                     if (
                         previous_active_index is not None
                         and active_index > previous_active_index
@@ -566,7 +650,8 @@ def main():
 
                             upload_csv(
                                 token,
-                                finalized_file
+                                finalized_file,
+                                delete_after=True
                             )
 
                         except Exception as e:
@@ -597,17 +682,9 @@ def main():
                     total_rows += len(df)
                     processed_files += 1
 
-                    # ==============================================
-                    # IMMEDIATELY ADVANCE STATE
-                    # ==============================================
-
                     state["sites"][site_id] = (
                         file_timestamp.isoformat()
                     )
-
-                    # ==============================================
-                    # PERIODIC STATE SAVE
-                    # ==============================================
 
                     if (
                         processed_files %
@@ -621,10 +698,6 @@ def main():
                         f"to {active_csv}",
                         flush=True
                     )
-
-                    # ==============================================
-                    # PERIODIC CHECKPOINT UPLOAD
-                    # ==============================================
 
                     if (
                         processed_files %
@@ -652,9 +725,12 @@ def main():
             flush=True
         )
 
-    # ======================================================
-    # FINAL CHECKPOINT
-    # ======================================================
+        if site_id in active_site_files:
+
+            cleanup_old_site_files(
+                site_id,
+                active_site_files[site_id]
+            )
 
     token = get_graph_token()
 
