@@ -29,7 +29,7 @@ CLIENT_SECRET = os.environ["AZURE_CLIENT_SECRET"]
 TENANT_ID = os.environ["AZURE_TENANT_ID"]
 ONEDRIVE_USER_EMAIL = os.environ["ONEDRIVE_USER_EMAIL"]
 
-ONEDRIVE_FOLDER = "/Reliability/AWSDB"
+ONEDRIVE_FOLDER = f"/Reliability/AWSDB/{SITE_GROUP}"
 
 # ==========================================================
 # SITE GROUP CONFIGURATION
@@ -240,7 +240,7 @@ EXCLUDED_SITES = {
 # FILE SETTINGS
 # ==========================================================
 
-STATE_FILE = "aws_site_state.json"
+STATE_FILE = f"aws_site_state_{SITE_GROUP}.json"
 
 RETENTION_DAYS = 730
 MAX_RUN_SECONDS = 19800
