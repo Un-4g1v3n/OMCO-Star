@@ -29,7 +29,7 @@ CLIENT_SECRET = os.environ["AZURE_CLIENT_SECRET"]
 TENANT_ID = os.environ["AZURE_TENANT_ID"]
 ONEDRIVE_USER_EMAIL = os.environ["ONEDRIVE_USER_EMAIL"]
 
-ONEDRIVE_FOLDER = f"/Reliability/AWSDB/{SITE_GROUP}"
+
 
 # ==========================================================
 # SITE GROUP CONFIGURATION
@@ -235,6 +235,8 @@ EXCLUDED_SITES = {
     # Temporary exclusions go here
     # "dead-site-id"
 }
+
+ONEDRIVE_FOLDER = f"/Reliability/AWSDB/{SITE_GROUP}"
 
 # ==========================================================
 # FILE SETTINGS
