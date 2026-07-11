@@ -236,7 +236,9 @@ EXCLUDED_SITES = {
     # "dead-site-id"
 }
 
-ONEDRIVE_FOLDER = f"/Reliability/AWSDB/{SITE_GROUP}"
+STATE_ONEDRIVE_FOLDER = (
+    "/Reliability/AWSDB/State"
+)
 
 # ==========================================================
 # FILE SETTINGS
@@ -661,7 +663,91 @@ def get_site_prefixes(s3):
 # ==========================================================
 # MAIN
 # ==========================================================
+def download_state_file(token):
 
+    remote_path = (
+        f"{STATE_ONEDRIVE_FOLDER}/"
+        f"{STATE_FILE}"
+    )
+
+    url = (
+        f"https://graph.microsoft.com/v1.0/"
+        f"users/{ONEDRIVE_USER_EMAIL}"
+        f"/drive/root:{remote_path}:/content"
+    )
+
+    headers = {
+        "Authorization": f"Bearer {token}"
+    }
+
+    response = requests.get(
+        url,
+        headers=headers,
+        timeout=60
+    )
+
+    if response.status_code == 200:
+
+        with open(
+            STATE_FILE,
+            "wb"
+        ) as f:
+
+            f.write(response.content)
+
+        print(
+            f"Downloaded state file "
+            f"{STATE_FILE}",
+            flush=True
+        )
+
+    else:
+
+        print(
+            "No existing state file found.",
+            flush=True
+        )
+
+def upload_state_file(token):
+
+    remote_path = (
+        f"{STATE_ONEDRIVE_FOLDER}/"
+        f"{STATE_FILE}"
+    )
+
+    upload_url = (
+        f"https://graph.microsoft.com/v1.0/"
+        f"users/{ONEDRIVE_USER_EMAIL}"
+        f"/drive/root:{remote_path}:/content"
+    )
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+
+    with open(
+        STATE_FILE,
+        "rb"
+    ) as f:
+
+        response = requests.put(
+            upload_url,
+            headers=headers,
+            data=f,
+            timeout=60
+        )
+
+    response.raise_for_status()
+
+    print(
+        f"Uploaded state file "
+        f"{STATE_FILE}",
+        flush=True
+    )
+
+
+        
 def main():
 
     print("\n" + "=" * 50, flush=True)
@@ -679,6 +765,10 @@ def main():
         f"Retention cutoff: {cutoff_date}",
         flush=True
     )
+
+    token = get_graph_token()
+
+    download_state_file(token)
 
     state = load_state()
 
@@ -720,6 +810,8 @@ def main():
             )
 
             save_state(state)
+
+            upload_state_file(token)
 
             return
 
@@ -806,6 +898,9 @@ def main():
                     )
 
                     save_state(state)
+
+                    upload_state_file(token)
+                    
 
                     return
 
@@ -914,6 +1009,8 @@ def main():
 
                         save_state(state)
 
+                        upload_state_file(token)
+
                     print(
                         f"  Added {len(df):,} rows "
                         f"to {active_csv}",
@@ -933,6 +1030,9 @@ def main():
                         )
 
                         save_state(state)
+
+                        upload_state_file(token)
+                        
 
                 except Exception as e:
 
@@ -961,6 +1061,8 @@ def main():
     )
 
     save_state(state)
+
+    upload_state_file(token)
 
     print("\n" + "=" * 50, flush=True)
     print("Run complete", flush=True)
