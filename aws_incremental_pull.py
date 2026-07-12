@@ -431,7 +431,7 @@ def download_existing_csvs(token, site_id):
         )
 
         remote_path = (
-            f"{ONEDRIVE_FOLDER}/{filename}"
+            f"{STATE_ONEDRIVE_FOLDER}/{filename}"
         )
 
         url = (
@@ -470,7 +470,7 @@ def upload_csv(token, local_path, delete_after=False):
     filename = Path(local_path).name
 
     remote_path = (
-        f"{ONEDRIVE_FOLDER}/{filename}"
+        f"{STATE_ONEDRIVE_FOLDER}/{filename}"
     )
 
     upload_url = (
