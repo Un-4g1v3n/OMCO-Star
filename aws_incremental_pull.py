@@ -241,7 +241,7 @@ STATE_ONEDRIVE_FOLDER = (
 )
 
 ONEDRIVE_FOLDER = (
-    "/Reliability/AWSDB/{SITE_GROUP}"
+    f"/Reliability/AWSDB/{SITE_GROUP}"
 )
 
 # ==========================================================
