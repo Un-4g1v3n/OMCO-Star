@@ -300,7 +300,13 @@ def get_graph_token():
     response.raise_for_status()
 
     return response.json()["access_token"]
-
+print()
+print("==========================================")
+print(f"SITE_GROUP: {SITE_GROUP}")
+print(f"STATE_FILE: {STATE_FILE}")
+print(f"ONEDRIVE_FOLDER: {ONEDRIVE_FOLDER}")
+print("==========================================")
+print()
 # ==========================================================
 # STATE
 # ==========================================================
